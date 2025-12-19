@@ -1,5 +1,5 @@
-import json
 from copy import deepcopy
+import json
 from typing import Any
 
 from aidial_client import AsyncDial
@@ -31,27 +31,64 @@ class MASCoordinator:
         # 4. Add to the stage generated coordination request and close the stage
         # 5. Handle coordination request (don't forget that all the content that will write called agent need to provide to stage)
         # 6. Generate final response based on the message from called agent
-        raise NotImplementedError()
+        client = AsyncDial(base_url=self.endpoint, api_version='2025-01-01-preview', api_key=request.api_key)
+
+        coordination_stage = StageProcessor.open_stage(choice=choice, stage_name="Coordination Request")
+        coordination_request = await self.__prepare_coordination_request(client=client, request=request)
+        coordination_stage.append_content(f"```json\n{coordination_request.model_dump_json(indent=2)}\n```\n")
+        StageProcessor.close_stage(stage=coordination_stage)
+
+        handle_stage = StageProcessor.open_stage(choice=choice, stage_name="Handling Request")
+        agent_message = await self.__handle_coordination_request(
+            coordination_request=coordination_request,
+            choice=choice,
+            stage=handle_stage,
+            request=request
+        )
+        StageProcessor.close_stage(stage=handle_stage)
+
+        final_response = await self.__final_response(
+            client=client,
+            choice=choice,
+            request=request,
+            agent_message=agent_message
+        )
+        logger.info("Final response generated: " + final_response.model_dump_json())
+        return final_response
 
     async def __prepare_coordination_request(self, client: AsyncDial, request: Request) -> CoordinationRequest:
-        #TODO:
-        # 1. Make call to LLM with prepared messages and COORDINATION_REQUEST_SYSTEM_PROMPT. For GPT model we can use
-        #    `response_format` https://platform.openai.com/docs/guides/structured-outputs?example=structured-data and
-        #    response will be returned in JSON format. The `response_format` parameter must be provided as extra_body dict
-        #    {response_format": {"type": "json_schema","json_schema": {"name": "response","schema": CoordinationRequest.model_json_schema()}}}
-        # 2. Get content from response -> choice -> message -> content
-        # 3. Load as dict
-        # 4. Create CoordinationRequest from result, since CoordinationRequest is pydentic model, you can use `model_validate` method
-        raise NotImplementedError()
+        response = await client.chat.completions.create(
+            messages=self.__prepare_messages(request, COORDINATION_REQUEST_SYSTEM_PROMPT),
+            deployment_name=self.deployment_name,
+            extra_body={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "response",
+                        "schema": CoordinationRequest.model_json_schema()
+                    }
+                },
+            }
+        )
+        
+        resp_content = json.loads(response.choices[0].message.content)
+        return CoordinationRequest.model_validate(resp_content)
 
     def __prepare_messages(self, request: Request, system_prompt: str) -> list[dict[str, Any]]:
-        #TODO:
-        # 1. Create array with messages, first message is system prompt and it is dict
-        # 2. Iterate through messages from request and:
-        #       - if user message that it has custom content and then add dict with user message and content (custom_content should be skipped)
-        #       - otherwise append it as dict with excluded none fields (use `dict` method, despite it is deprecated since
-        #         DIAL is using pydentic.v1)
-        raise NotImplementedError()
+        messages = [{
+            "role": Role.SYSTEM,
+            "content": system_prompt
+        }]
+        for message in request.messages:
+            if message.role == Role.USER and message.custom_content is not None:
+                msg_copy = deepcopy(message)
+                messages.append({
+                    "role": Role.USER,
+                    "content": StrictStr(msg_copy.content)
+                })
+            else:
+                messages.append(message.model_dump(exclude_none=True))
+        return messages
 
     async def __handle_coordination_request(
             self,
@@ -60,9 +97,23 @@ class MASCoordinator:
             stage: Stage,
             request: Request
     ) -> Message:
-        #TODO:
-        # Make appropriate coordination requests to to proper agents and return the result
-        raise NotImplementedError()
+        if coordination_request.agent_name is AgentName.GPA:
+            return await GPAGateway(endpoint=self.endpoint).response(
+                choice=choice,
+                request=request,
+                stage=stage,
+                additional_instructions=coordination_request.additional_instructions,
+            )
+
+        elif coordination_request.agent_name is AgentName.UMS:
+            return await UMSAgentGateway(ums_agent_endpoint=self.ums_agent_endpoint).response(
+                choice=choice,
+                request=request,
+                stage=stage,
+                additional_instructions=coordination_request.additional_instructions,
+            )
+        else:
+            raise ValueError(f"Unsupported Agent: {coordination_request.agent_name}")
 
     async def __final_response(
             self, client: AsyncDial,
@@ -76,4 +127,27 @@ class MASCoordinator:
         # 3. Update last message content with augmented prompt
         # 4. Call LLM with streaming
         # 5. Stream final response to choice
-        raise NotImplementedError()
+    
+        messages = self.__prepare_messages(request, FINAL_RESPONSE_SYSTEM_PROMPT)
+        augmented_request = f"## CONTEXT:\n {agent_message.content}\n ---\n ## USER_REQUEST: \n {messages[-1]["content"]}"
+        messages[-1]["content"] = augmented_request
+
+        chunks = await client.chat.completions.create(
+            stream=True,
+            messages=messages,
+            deployment_name=self.deployment_name
+        )
+
+        content = ''
+        async for chunk in chunks:
+            if chunk.choices and len(chunk.choices) > 0:
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    choice.append_content(delta.content)
+                    content += delta.content
+
+        return Message(
+            role=Role.ASSISTANT,
+            content=StrictStr(content),
+            custom_content=agent_message.custom_content
+        )
